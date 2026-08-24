@@ -1,6 +1,7 @@
 // bb-plugin-notifications-pro — backend: settings, notification log, RPC.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { formatResponsePreview } from "./src/response-preview";
 
 const notificationSourceSchema = z.enum(["thread", "assigned_task"]);
 const notificationTargetKindSchema = z.enum(["thread", "task"]);
@@ -75,6 +76,10 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: z.object({ dismissed: z.number().int() }).strict(),
   },
+  getUnreadCount: {
+    input: z.null(),
+    output: z.object({ unreadCount: z.number().int() }).strict(),
+  },
   clearDismissed: {
     input: z.null(),
     output: z.object({ removed: z.number().int() }).strict(),
@@ -98,6 +103,10 @@ export const rpcContract = defineRpcContract({
         ),
       })
       .strict(),
+  },
+  getResponsePreview: {
+    input: z.object({ threadId: z.string().min(1) }).strict(),
+    output: z.object({ preview: z.string().nullable() }).strict(),
   },
 });
 
@@ -290,6 +299,9 @@ export default async function plugin(bb: BbPluginApi) {
       return { updated: result.changes };
     },
     dismiss: ({ id }) => {
+      const existing = db
+        .prepare(`SELECT * FROM notifications WHERE id = ?`)
+        .get(id) as Record<string, unknown> | undefined;
       const result = db
         .prepare(
           `UPDATE notifications
@@ -298,7 +310,12 @@ export default async function plugin(bb: BbPluginApi) {
         )
         .run(Date.now(), Date.now(), id);
       if (result.changes > 0) {
-        bb.realtime.publish("notifications", { type: "dismiss", id });
+        bb.realtime.publish("notifications", {
+          type: "dismiss",
+          id,
+          targetKind: existing?.target_kind ?? null,
+          targetId: existing?.target_id ?? null,
+        });
       }
       return { ok: result.changes > 0 };
     },
@@ -321,6 +338,17 @@ export default async function plugin(bb: BbPluginApi) {
       }
       return { dismissed: result.changes };
     },
+    getUnreadCount: () => {
+      const unreadCount = (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS c FROM notifications
+             WHERE read_at IS NULL AND dismissed_at IS NULL`,
+          )
+          .get() as { c: number }
+      ).c;
+      return { unreadCount };
+    },
     clearDismissed: () => {
       const result = db
         .prepare(`DELETE FROM notifications WHERE dismissed_at IS NOT NULL`)
@@ -339,6 +367,14 @@ export default async function plugin(bb: BbPluginApi) {
         const message =
           error instanceof Error ? error.message : "Tasks Pro unavailable";
         return { available: false, error: message, tasks: [] };
+      }
+    },
+    async getResponsePreview({ threadId }) {
+      try {
+        const result = await bb.sdk.threads.output({ threadId });
+        return { preview: formatResponsePreview(result.output) };
+      } catch {
+        return { preview: null };
       }
     },
   });

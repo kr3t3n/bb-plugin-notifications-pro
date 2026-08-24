@@ -98,6 +98,14 @@ describe("attentionNotificationBody", () => {
       "Agent responded",
     );
   });
+
+  it("prefers a response preview when provided", () => {
+    expect(
+      attentionNotificationBody(thread({ isUnread: true }), {
+        responsePreview: "Fixed the notification title on macOS.",
+      }),
+    ).toBe("Fixed the notification title on macOS.");
+  });
 });
 
 describe("threadNotificationId", () => {

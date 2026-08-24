@@ -13,7 +13,7 @@ export function SidebarAccessory() {
   return (
     <span
       className="text-xs font-medium tabular-nums text-foreground"
-      aria-label={`${badgeCount} needing attention`}
+      aria-label={`${badgeCount} unread notifications`}
     >
       {label}
     </span>

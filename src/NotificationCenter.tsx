@@ -4,6 +4,7 @@ import {
   useRealtime,
   useRpc,
   useSettings,
+  experimental_useSidebarThreadActions as useSidebarThreadActions,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract, NotificationRow } from "../server";
 import { Button } from "@/components/ui/button";
@@ -38,6 +39,7 @@ export function NotificationCenter() {
 
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
+  const threadActions = useSidebarThreadActions();
   const settings = useSettings();
   const [items, setItems] = useState<NotificationRow[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -80,11 +82,17 @@ export function NotificationCenter() {
     void refresh();
   });
 
+  /** Clear the Sidebar Pro bell for thread targets (live unread attention). */
+  const clearThreadAttention = async (targetId: string) => {
+    await threadActions.setRead(targetId, true).catch(() => undefined);
+  };
+
   const openItem = async (item: NotificationRow) => {
     if (item.readAt == null) {
       await rpc.call("markRead", { id: item.id }).catch(() => undefined);
     }
     if (item.targetKind === "thread") {
+      await clearThreadAttention(item.targetId);
       navigate.toThread(item.targetId);
       return;
     }
@@ -92,12 +100,21 @@ export function NotificationCenter() {
   };
 
   const markAllRead = async () => {
+    const threadTargets = items
+      .filter((item) => item.targetKind === "thread" && item.readAt == null)
+      .map((item) => item.targetId);
     await rpc.call("markAllRead", null);
+    for (const threadId of [...new Set(threadTargets)]) {
+      await clearThreadAttention(threadId);
+    }
     await refresh();
   };
 
-  const dismiss = async (id: string) => {
-    await rpc.call("dismiss", { id });
+  const dismiss = async (item: NotificationRow) => {
+    await rpc.call("dismiss", { id: item.id });
+    if (item.targetKind === "thread") {
+      await clearThreadAttention(item.targetId);
+    }
     await refresh();
   };
 
@@ -200,7 +217,7 @@ export function NotificationCenter() {
                     variant="ghost"
                     className="shrink-0"
                     onClick={() => {
-                      void dismiss(item.id);
+                      void dismiss(item);
                     }}
                   >
                     Dismiss

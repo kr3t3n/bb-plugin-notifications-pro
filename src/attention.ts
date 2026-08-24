@@ -41,7 +41,10 @@ export function attentionNotificationTitle(
 
 export function attentionNotificationBody(
   thread: PluginSidebarThread,
+  options?: { responsePreview?: string | null },
 ): string {
+  const preview = options?.responsePreview?.trim();
+  if (preview) return preview;
   if (
     thread.hasPendingInteraction ||
     thread.indicator === "waiting-for-input"

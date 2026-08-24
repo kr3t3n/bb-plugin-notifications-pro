@@ -35,6 +35,26 @@ export function notificationPermission():
 }
 
 /**
+ * macOS Electron often shows Web Notification body text more prominently
+ * than the API title. Repeat the session name in the body so the OS toast
+ * shows the thread title, not only "Agent responded".
+ */
+export function formatOsNotificationDisplay(options: {
+  title: string;
+  body: string;
+}): { title: string; body: string } {
+  const title = options.title.trim();
+  const body = options.body.trim();
+  if (!title) {
+    return { title: "bb", body: body || "Notification" };
+  }
+  if (!body || body === title) {
+    return { title, body: title };
+  }
+  return { title, body: `${title} — ${body}` };
+}
+
+/**
  * Show one OS notification for a thread that just entered attention.
  * `tag` collapses repeat alerts for the same thread.
  */
@@ -48,9 +68,18 @@ export function showOsNotification(options: {
     return false;
   }
   if (Notification.permission !== "granted") return false;
+  const display = formatOsNotificationDisplay({
+    title: options.title,
+    body: options.body,
+  });
+  const previousTitle =
+    typeof document !== "undefined" ? document.title : undefined;
   try {
-    const notification = new Notification(options.title, {
-      body: options.body,
+    if (typeof document !== "undefined") {
+      document.title = display.title;
+    }
+    const notification = new Notification(display.title, {
+      body: display.body,
       tag: options.tag,
     });
     notification.onclick = () => {
@@ -65,6 +94,10 @@ export function showOsNotification(options: {
     return true;
   } catch {
     return false;
+  } finally {
+    if (typeof document !== "undefined" && previousTitle !== undefined) {
+      document.title = previousTitle;
+    }
   }
 }
 
@@ -75,10 +108,11 @@ export function threadOsNotificationTag(threadId: string): string {
 export function showThreadResponseNotification(
   thread: PluginSidebarThread,
   onOpen: () => void,
+  options?: { body?: string },
 ): boolean {
   return showOsNotification({
     title: attentionNotificationTitle(thread),
-    body: attentionNotificationBody(thread),
+    body: options?.body ?? attentionNotificationBody(thread),
     tag: threadOsNotificationTag(thread.id),
     onOpen,
   });

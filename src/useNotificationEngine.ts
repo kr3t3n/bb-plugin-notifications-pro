@@ -3,9 +3,11 @@ import type { PluginSidebarThread } from "@get-bb/plugin-sdk";
 import {
   useBbContext,
   useBbNavigate,
+  useRealtime,
   useRpc,
   useSettings,
   experimental_useSidebarThreads as useSidebarThreads,
+  experimental_useSidebarThreadActions as useSidebarThreadActions,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "../server";
 import {
@@ -54,7 +56,11 @@ type ProcessThreadArgs = {
   threadsEnabled: boolean;
   osEnabled: boolean;
   openThread: (threadId: string) => void;
-  record: (thread: PluginSidebarThread) => Promise<void>;
+  record: (
+    thread: PluginSidebarThread,
+    content: { title: string; body: string },
+  ) => Promise<void>;
+  fetchResponsePreview: (threadId: string) => Promise<string | null>;
   markRead: (id: string) => Promise<void>;
   dismissForThread: (threadId: string) => Promise<void>;
 };
@@ -139,13 +145,22 @@ function processThreadSnapshot(args: ProcessThreadArgs): number {
       await ensureNotificationPermission();
     }
     for (const thread of newlyAwaiting) {
-      await args.record(thread).catch(() => undefined);
+      const responsePreview = await args
+        .fetchResponsePreview(thread.id)
+        .catch(() => null);
+      const title = attentionNotificationTitle(thread);
+      const body = attentionNotificationBody(thread, { responsePreview });
+      await args.record(thread, { title, body }).catch(() => undefined);
       if (args.osEnabled) {
         const id = threadNotificationId(thread);
-        showThreadResponseNotification(thread, () => {
-          args.openThread(thread.id);
-          void args.markRead(id);
-        });
+        showThreadResponseNotification(
+          thread,
+          () => {
+            args.openThread(thread.id);
+            void args.markRead(id);
+          },
+          { body },
+        );
       }
     }
   })();
@@ -222,17 +237,19 @@ function processAssignedSnapshot(args: ProcessAssignedArgs): number {
 
 /**
  * Watch live threads + Tasks Pro assignees, edge-trigger OS + center records,
- * keep the Dock badge in sync. Safe to mount from the sidebar accessory and
- * the notification center at the same time.
+ * keep the Dock / nav badge on the center unread count. Safe to mount from the
+ * sidebar accessory and the notification center at the same time.
  */
 export function useNotificationEngine(): NotificationEngineState {
   const { threadId: activeThreadId } = useBbContext();
   const navigate = useBbNavigate();
   const { threads } = useSidebarThreads();
+  const threadActions = useSidebarThreadActions();
   const settings = useSettings();
   const rpc = useRpc<typeof rpcContract>();
   const [attentionCount, setAttentionCount] = useState(0);
   const [assignedCount, setAssignedCount] = useState(0);
+  const [badgeCount, setBadgeCount] = useState(0);
   const [assignedTasks, setAssignedTasks] = useState<AssignedTask[]>([]);
 
   const threadsEnabled =
@@ -254,6 +271,62 @@ export function useNotificationEngine(): NotificationEngineState {
       }
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const refreshBadge = async () => {
+      try {
+        const result = await rpc.call("getUnreadCount", null);
+        if (cancelled) return;
+        const next = result.unreadCount;
+        setBadgeCount(next);
+        if (badgeEnabled) {
+          void syncAppBadge(next);
+        } else {
+          void syncAppBadge(0);
+        }
+      } catch {
+        // Leave the last known badge if the lookup fails.
+      }
+    };
+
+    void refreshBadge();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc, badgeEnabled]);
+
+  useRealtime("notifications", (event) => {
+    const payload = event as {
+      type?: string;
+      targetKind?: string | null;
+      targetId?: string | null;
+    };
+    if (
+      payload?.type === "dismiss" &&
+      payload.targetKind === "thread" &&
+      typeof payload.targetId === "string"
+    ) {
+      closeThreadOsNotification(payload.targetId);
+    }
+    void (async () => {
+      try {
+        const result = await rpc.call("getUnreadCount", null);
+        const enabled =
+          (settings.values?.appBadge as boolean | undefined) ?? true;
+        setBadgeCount(result.unreadCount);
+        if (enabled) {
+          void syncAppBadge(result.unreadCount);
+        } else {
+          void syncAppBadge(0);
+        }
+      } catch {
+        // Ignore transient badge refresh failures.
+      }
+    })();
+  });
 
   useEffect(() => {
     if (!tasksEnabled) {
@@ -295,17 +368,22 @@ export function useNotificationEngine(): NotificationEngineState {
       threadsEnabled,
       osEnabled,
       openThread: (threadId) => {
+        void threadActions.setRead(threadId, true).catch(() => undefined);
         navigate.toThread(threadId);
       },
-      record: async (thread) => {
+      record: async (thread, content) => {
         await rpc.call("record", {
           id: threadNotificationId(thread),
           source: "thread",
-          title: attentionNotificationTitle(thread),
-          body: attentionNotificationBody(thread),
+          title: content.title,
+          body: content.body,
           targetKind: "thread",
           targetId: thread.id,
         });
+      },
+      fetchResponsePreview: async (threadId) => {
+        const result = await rpc.call("getResponsePreview", { threadId });
+        return result.preview;
       },
       markRead: async (id) => {
         await rpc.call("markRead", { id }).catch(() => undefined);
@@ -341,13 +419,6 @@ export function useNotificationEngine(): NotificationEngineState {
 
     setAttentionCount(threadCount);
     setAssignedCount(taskCount);
-
-    const badge = threadCount + taskCount;
-    if (badgeEnabled) {
-      void syncAppBadge(badge);
-    } else {
-      void syncAppBadge(0);
-    }
   }, [
     threads,
     assignedTasks,
@@ -355,14 +426,14 @@ export function useNotificationEngine(): NotificationEngineState {
     threadsEnabled,
     tasksEnabled,
     osEnabled,
-    badgeEnabled,
     navigate,
+    threadActions,
     rpc,
   ]);
 
   return {
     attentionCount,
     assignedCount,
-    badgeCount: attentionCount + assignedCount,
+    badgeCount,
   };
 }

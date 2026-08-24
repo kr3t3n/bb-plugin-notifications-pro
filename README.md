@@ -11,12 +11,14 @@ in-app notification center. Separate from Sidebar Pro.
 - **Assigned tasks** — edge-triggered when Tasks Pro assigns a task to you
   (`kind: "me"`). Click opens the task in the Tasks plugin. Toggle separately
   from thread alerts via `sourceAssignedTasks`.
-- **App / Dock badge** — live attention count (threads needing attention +
-  tasks assigned to you) via `navigator.setAppBadge`.
+- **App / Dock badge** — unread notification count (same as the center) via
+  `navigator.setAppBadge`. Mark-all-read and dismiss clear it.
 - **Notification center** — nav panel at Notifications with unread history,
   mark-read, and dismiss. Unread rows sort above read rows; within each group
   newest trigger time first. Thread rows auto-dismiss when that thread leaves
-  attention (read / resolved).
+  attention (read / resolved). Mark-read and dismiss both clear that item from
+  the nav and Dock badge, and mark the underlying thread read so the Sidebar
+  Pro bell drops too.
 - **Settings** — enable/disable OS toasts, badge, thread source, and assigned-
   task source independently.
 
