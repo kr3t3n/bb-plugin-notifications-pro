@@ -1,8 +1,8 @@
 /**
  * Labels Pro consumer helpers for Notifications Pro.
  *
- * Canonical methods live in Labels Pro `src/rpc-contract.ts` (LABL-3).
- * Sidebar Pro also polls an optional bulk `listAssignments`; we try that
+ * Canonical methods live in Labels Pro `src/rpc-contract.ts`.
+ * An optional bulk `listAssignments` may exist in future; we try that
  * first and fall back to per-muted-label `listThreadsByLabel`.
  */
 
@@ -40,7 +40,7 @@ export const listThreadsByLabelOut = z
   })
   .strict();
 
-/** Optional bulk map used by Sidebar Pro; may arrive with LABL-7. */
+/** Optional bulk map; not part of the stable Labels Pro contract today. */
 export const listAssignmentsOut = z
   .object({
     assignments: z.array(

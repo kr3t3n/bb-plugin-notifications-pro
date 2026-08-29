@@ -2,7 +2,8 @@
 
 Standalone BB plugin for desktop notifications, Dock/app badge counts, phone
 Web Push (home-screen PWA), and an in-app notification center. Separate from
-Sidebar Pro.
+[Sidebar Pro](https://github.com/kr3t3n/bb-plugin-sidebar-pro). Optional mute
+integration with [Labels Pro](https://github.com/kr3t3n/bb-plugin-labels-pro).
 
 ## Features
 
@@ -32,6 +33,24 @@ Sidebar Pro.
   when that label exists (Labels Pro auto-tag). Graceful when Labels Pro is
   missing. Mark-all-read still clears non-muted threads only.
 
+### Labels Pro (optional)
+
+**Contract:** plugin id `labels-pro`, realtime channel `labels`, methods
+`listLabels` + `listThreadsByLabel` (see Labels Pro
+[docs/rpc-contract.md](https://github.com/kr3t3n/bb-plugin-labels-pro/blob/main/docs/rpc-contract.md)).
+Helpers: `src/labels-pro.ts`, `src/muted-labels.ts`, mute UI in
+`src/MuteLabelsSettingsPanel.tsx`.
+
+**Graceful fallback:** Labels Pro is **not** required in `engines`
+(`bb >= 0.39`, `bbPluginSdk >= 0.4.8` for this plugin). If Labels Pro is
+missing or RPC fails, mute-by-label stays off / shows unavailable and thread /
+task alerts continue normally. An optional bulk assignment probe may be tried;
+when absent, Notifications Pro falls back to per-label `listThreadsByLabel`.
+
+**Sidebar Pro:** inbox filter/chips live in
+[Sidebar Pro](https://github.com/kr3t3n/bb-plugin-sidebar-pro); this plugin owns
+toasts, badge, center, and mute.
+
 ## Double-alert rule
 
 One attention edge creates at most one visible system notification:
@@ -56,6 +75,8 @@ push** off removes this device’s subscription on the server.
    or clearing site data.
 
 ## Install
+
+Requires `bb >= 0.39` and `bbPluginSdk >= 0.4.8`. Labels Pro is optional.
 
 ```sh
 npm install
@@ -92,6 +113,12 @@ bb plugin config notifications-pro set mutedLabels "automation"
 Prefer **Settings → Notifications Pro → Mute labels** for checkboxes. The
 `mutedLabels` string is a fallback when editing via CLI; the mute panel writes
 the same list through RPC (`setMutedLabels`).
+
+## Manual test (with Labels + Sidebar Pro)
+
+See the shared checklist in the
+[Labels Pro README](https://github.com/kr3t3n/bb-plugin-labels-pro#manual-test-checklist-pro-stack):
+auto-tag → filter/hide → mark filtered read → muted notifications → header edit.
 
 ## Layout
 
