@@ -14,13 +14,15 @@ export function threadNeedsAttention(thread: PluginSidebarThread): boolean {
   return false;
 }
 
-/** How many non-archived threads need attention right now. */
+/** How many non-archived, non-muted threads need attention right now. */
 export function countAttentionThreads(
   threads: readonly PluginSidebarThread[],
+  mutedThreadIds?: ReadonlySet<string> | null,
 ): number {
   let count = 0;
   for (const thread of threads) {
     if (thread.isArchived) continue;
+    if (mutedThreadIds?.has(thread.id)) continue;
     if (threadNeedsAttention(thread)) count += 1;
   }
   return count;
@@ -41,10 +43,7 @@ export function attentionNotificationTitle(
 
 export function attentionNotificationBody(
   thread: PluginSidebarThread,
-  options?: { responsePreview?: string | null },
 ): string {
-  const preview = options?.responsePreview?.trim();
-  if (preview) return preview;
   if (
     thread.hasPendingInteraction ||
     thread.indicator === "waiting-for-input"
@@ -64,17 +63,19 @@ export function threadNotificationId(thread: PluginSidebarThread): string {
 
 /**
  * Threads that just entered attention since the prior snapshot.
- * Skips archived threads and the currently active thread.
+ * Skips archived threads, muted-label threads, and the currently active thread.
  */
 export function collectNewlyAwaitingThreads(args: {
   threads: readonly PluginSidebarThread[];
   awaiting: Map<string, boolean>;
   prior: Map<string, boolean>;
   activeThreadId: string | null;
+  mutedThreadIds?: ReadonlySet<string> | null;
 }): PluginSidebarThread[] {
   const newly: PluginSidebarThread[] = [];
   for (const thread of args.threads) {
     if (thread.isArchived) continue;
+    if (args.mutedThreadIds?.has(thread.id)) continue;
     const now = args.awaiting.get(thread.id) === true;
     const was = args.prior.get(thread.id) === true;
     if (now && !was && thread.id !== args.activeThreadId) {

@@ -82,6 +82,18 @@ describe("countAttentionThreads", () => {
       ]),
     ).toBe(1);
   });
+
+  it("skips muted-label threads", () => {
+    expect(
+      countAttentionThreads(
+        [
+          thread({ id: "a", isUnread: true }),
+          thread({ id: "b", isUnread: true }),
+        ],
+        new Set(["b"]),
+      ),
+    ).toBe(1);
+  });
 });
 
 describe("attentionNotificationBody", () => {
@@ -97,14 +109,6 @@ describe("attentionNotificationBody", () => {
     expect(attentionNotificationBody(thread({ isUnread: true }))).toBe(
       "Agent responded",
     );
-  });
-
-  it("prefers a response preview when provided", () => {
-    expect(
-      attentionNotificationBody(thread({ isUnread: true }), {
-        responsePreview: "Fixed the notification title on macOS.",
-      }),
-    ).toBe("Fixed the notification title on macOS.");
   });
 });
 
@@ -178,6 +182,28 @@ describe("collectNewlyAwaitingThreads", () => {
         activeThreadId: null,
       }),
     ).toEqual([]);
+  });
+
+  it("skips muted-label threads", () => {
+    const muted = thread({ id: "muted", isUnread: true });
+    const other = thread({ id: "other", isUnread: true });
+    const awaiting = new Map([
+      ["muted", true],
+      ["other", true],
+    ]);
+    const prior = new Map([
+      ["muted", false],
+      ["other", false],
+    ]);
+    expect(
+      collectNewlyAwaitingThreads({
+        threads: [muted, other],
+        awaiting,
+        prior,
+        activeThreadId: null,
+        mutedThreadIds: new Set(["muted"]),
+      }).map((t) => t.id),
+    ).toEqual(["other"]);
   });
 });
 

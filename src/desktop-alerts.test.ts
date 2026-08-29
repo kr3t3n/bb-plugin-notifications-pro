@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk";
 import {
   closeThreadOsNotification,
-  formatOsNotificationDisplay,
   showAssignedTaskNotification,
   showThreadResponseNotification,
   syncAppBadge,
@@ -67,26 +66,6 @@ describe("syncAppBadge", () => {
   });
 });
 
-describe("formatOsNotificationDisplay", () => {
-  it("leads the body with the session title for macOS toasts", () => {
-    expect(
-      formatOsNotificationDisplay({
-        title: "Fix BB notification agent name",
-        body: "Agent responded",
-      }),
-    ).toEqual({
-      title: "Fix BB notification agent name",
-      body: "Fix BB notification agent name — Agent responded",
-    });
-  });
-
-  it("falls back when the title is empty", () => {
-    expect(
-      formatOsNotificationDisplay({ title: "  ", body: "Needs your input" }),
-    ).toEqual({ title: "bb", body: "Needs your input" });
-  });
-});
-
 describe("showThreadResponseNotification", () => {
   it("returns false when permission is not granted", () => {
     vi.stubGlobal("Notification", {
@@ -116,33 +95,7 @@ describe("showThreadResponseNotification", () => {
       true,
     );
     expect(NotificationMock).toHaveBeenCalledWith("Hello", {
-      body: "Hello — Agent responded",
-      tag: "bb-notifications-pro:thread:thr_1",
-    });
-  });
-
-  it("uses a provided body override", () => {
-    const NotificationMock = vi.fn(function NotificationMock(
-      this: { onclick: null | (() => void); close: () => void },
-      _title: string,
-      _opts: unknown,
-    ) {
-      this.onclick = null;
-      this.close = vi.fn();
-    });
-    Object.assign(NotificationMock, {
-      permission: "granted" as NotificationPermission,
-    });
-    vi.stubGlobal("Notification", NotificationMock);
-    vi.stubGlobal("window", { focus: vi.fn() });
-
-    showThreadResponseNotification(
-      thread(),
-      () => undefined,
-      { body: "Here is the start of my reply." },
-    );
-    expect(NotificationMock).toHaveBeenCalledWith("Hello", {
-      body: "Hello — Here is the start of my reply.",
+      body: "Agent responded",
       tag: "bb-notifications-pro:thread:thr_1",
     });
   });
@@ -200,7 +153,7 @@ describe("showAssignedTaskNotification", () => {
       ),
     ).toBe(true);
     expect(NotificationMock).toHaveBeenCalledWith("Notify on assign", {
-      body: "Notify on assign — Assigned to you · NP-2",
+      body: "Assigned to you · NP-2",
       tag: "bb-notifications-pro:assigned_task:tid_1",
     });
   });

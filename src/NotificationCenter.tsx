@@ -5,10 +5,13 @@ import {
   useRpc,
   useSettings,
   experimental_useSidebarThreadActions as useSidebarThreadActions,
+  experimental_useSidebarThreads as useSidebarThreads,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract, NotificationRow } from "../server";
 import { Button } from "@/components/ui/button";
+import { threadNeedsAttention } from "./attention";
 import { openTasksPluginTask } from "./assigned-tasks";
+import { closeThreadOsNotification, syncAppBadge } from "./desktop-alerts";
 import { useNotificationEngine } from "./useNotificationEngine";
 import { cn } from "@/lib/utils";
 
@@ -35,10 +38,11 @@ function sourceLabel(source: NotificationRow["source"]): string {
 
 export function NotificationCenter() {
   // Keep the engine alive on compact viewports (sidebar accessory is hidden).
-  useNotificationEngine();
+  const { mutedThreadIds } = useNotificationEngine();
 
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
+  const { threads } = useSidebarThreads();
   const threadActions = useSidebarThreadActions();
   const settings = useSettings();
   const [items, setItems] = useState<NotificationRow[]>([]);
@@ -82,8 +86,12 @@ export function NotificationCenter() {
     void refresh();
   });
 
-  /** Clear the Sidebar Pro bell for thread targets (live unread attention). */
+  /**
+   * Mark the live thread read so bb drops unread/pending favicon attention
+   * on the app/tab icon, and close any OS toast for that thread.
+   */
   const clearThreadAttention = async (targetId: string) => {
+    closeThreadOsNotification(targetId);
     await threadActions.setRead(targetId, true).catch(() => undefined);
   };
 
@@ -100,12 +108,32 @@ export function NotificationCenter() {
   };
 
   const markAllRead = async () => {
-    const threadTargets = items
-      .filter((item) => item.targetKind === "thread" && item.readAt == null)
-      .map((item) => item.targetId);
+    // Center rows alone are not enough: unread threads still drive bb's
+    // app/tab favicon attention. Clear every live attention thread too,
+    // except muted-label threads (they never raised a center edge).
+    const threadIds = new Set<string>();
+    for (const item of items) {
+      if (item.targetKind === "thread" && item.readAt == null) {
+        if (!mutedThreadIds.has(item.targetId)) {
+          threadIds.add(item.targetId);
+        }
+      }
+    }
+    for (const thread of threads) {
+      if (thread.isArchived) continue;
+      if (mutedThreadIds.has(thread.id)) continue;
+      if (threadNeedsAttention(thread)) threadIds.add(thread.id);
+    }
+
     await rpc.call("markAllRead", null);
-    for (const threadId of [...new Set(threadTargets)]) {
-      await clearThreadAttention(threadId);
+    await Promise.all(
+      [...threadIds].map((threadId) => clearThreadAttention(threadId)),
+    );
+    // Clear the Badging API / Dock badge immediately; do not wait on realtime.
+    const badgeOn =
+      (settings.values?.appBadge as boolean | undefined) ?? true;
+    if (badgeOn) {
+      await syncAppBadge(0);
     }
     await refresh();
   };
@@ -122,6 +150,12 @@ export function NotificationCenter() {
   const tasksOn =
     (settings.values?.sourceAssignedTasks as boolean | undefined) ?? true;
   const osOn = (settings.values?.osNotifications as boolean | undefined) ?? true;
+  const sidebarAttentionCount = threads.reduce((count, thread) => {
+    if (thread.isArchived) return count;
+    if (mutedThreadIds.has(thread.id)) return count;
+    return threadNeedsAttention(thread) ? count + 1 : count;
+  }, 0);
+  const canMarkAllRead = unreadCount > 0 || sidebarAttentionCount > 0;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -148,7 +182,7 @@ export function NotificationCenter() {
             <Button
               size="sm"
               variant="outline"
-              disabled={unreadCount === 0}
+              disabled={!canMarkAllRead}
               onClick={() => {
                 void markAllRead();
               }}

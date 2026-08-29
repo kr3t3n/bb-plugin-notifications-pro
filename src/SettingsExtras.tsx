@@ -15,7 +15,8 @@ export function SettingsExtras() {
     <div className="space-y-3 text-sm text-muted-foreground">
       <p>
         Toggle sources above. Thread attention uses the live sidebar feed.
-        Assigned-task alerts poll Tasks Pro for `kind: me` assignees.
+        Assigned-task alerts poll Tasks Pro for `kind: me` assignees. Mute
+        labels (below) silence Labels Pro-tagged threads.
       </p>
       <div className="flex flex-wrap items-center gap-2">
         <span>

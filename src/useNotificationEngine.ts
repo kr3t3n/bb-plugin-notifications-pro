@@ -34,11 +34,14 @@ import {
   showThreadResponseNotification,
   syncAppBadge,
 } from "./desktop-alerts";
+import { threadIdIsMuted } from "./muted-labels";
 
 export type NotificationEngineState = {
   attentionCount: number;
   assignedCount: number;
   badgeCount: number;
+  /** Thread ids currently silenced by muted Labels Pro labels. */
+  mutedThreadIds: ReadonlySet<string>;
 };
 
 /** Shared across accessory + center mounts so edges fire once. */
@@ -49,18 +52,16 @@ let lastAssignedFingerprint: string | null = null;
 let engineMounts = 0;
 
 const ASSIGNED_POLL_MS = 5_000;
+const MUTE_POLL_MS = 10_000;
 
 type ProcessThreadArgs = {
   threads: readonly PluginSidebarThread[];
   activeThreadId: string | null;
   threadsEnabled: boolean;
   osEnabled: boolean;
+  mutedThreadIds: ReadonlySet<string>;
   openThread: (threadId: string) => void;
-  record: (
-    thread: PluginSidebarThread,
-    content: { title: string; body: string },
-  ) => Promise<void>;
-  fetchResponsePreview: (threadId: string) => Promise<string | null>;
+  record: (thread: PluginSidebarThread) => Promise<void>;
   markRead: (id: string) => Promise<void>;
   dismissForThread: (threadId: string) => Promise<void>;
 };
@@ -69,10 +70,12 @@ function awaitingFingerprint(
   awaiting: Map<string, boolean>,
   activeThreadId: string | null,
   threadsEnabled: boolean,
+  mutedThreadIds: ReadonlySet<string>,
 ): string {
   const parts: string[] = [
     `a:${activeThreadId ?? ""}`,
     `t:${threadsEnabled ? 1 : 0}`,
+    `m:${[...mutedThreadIds].sort().join(",")}`,
   ];
   for (const [id, on] of awaiting) {
     if (on) parts.push(id);
@@ -83,12 +86,16 @@ function awaitingFingerprint(
 
 function processThreadSnapshot(args: ProcessThreadArgs): number {
   const count = args.threadsEnabled
-    ? countAttentionThreads(args.threads)
+    ? countAttentionThreads(args.threads, args.mutedThreadIds)
     : 0;
 
   const awaiting = new Map<string, boolean>();
   for (const thread of args.threads) {
-    if (thread.isArchived || !args.threadsEnabled) {
+    if (
+      thread.isArchived ||
+      !args.threadsEnabled ||
+      threadIdIsMuted(thread.id, args.mutedThreadIds)
+    ) {
       awaiting.set(thread.id, false);
       continue;
     }
@@ -99,6 +106,7 @@ function processThreadSnapshot(args: ProcessThreadArgs): number {
     awaiting,
     args.activeThreadId,
     args.threadsEnabled,
+    args.mutedThreadIds,
   );
   if (fingerprint === lastFingerprint) {
     return count;
@@ -121,6 +129,7 @@ function processThreadSnapshot(args: ProcessThreadArgs): number {
     awaiting,
     prior,
     activeThreadId: args.activeThreadId,
+    mutedThreadIds: args.mutedThreadIds,
   });
   const clearedIds = collectClearedAttentionThreadIds({
     threads: args.threads,
@@ -145,22 +154,13 @@ function processThreadSnapshot(args: ProcessThreadArgs): number {
       await ensureNotificationPermission();
     }
     for (const thread of newlyAwaiting) {
-      const responsePreview = await args
-        .fetchResponsePreview(thread.id)
-        .catch(() => null);
-      const title = attentionNotificationTitle(thread);
-      const body = attentionNotificationBody(thread, { responsePreview });
-      await args.record(thread, { title, body }).catch(() => undefined);
+      await args.record(thread).catch(() => undefined);
       if (args.osEnabled) {
         const id = threadNotificationId(thread);
-        showThreadResponseNotification(
-          thread,
-          () => {
-            args.openThread(thread.id);
-            void args.markRead(id);
-          },
-          { body },
-        );
+        showThreadResponseNotification(thread, () => {
+          args.openThread(thread.id);
+          void args.markRead(id);
+        });
       }
     }
   })();
@@ -251,6 +251,9 @@ export function useNotificationEngine(): NotificationEngineState {
   const [assignedCount, setAssignedCount] = useState(0);
   const [badgeCount, setBadgeCount] = useState(0);
   const [assignedTasks, setAssignedTasks] = useState<AssignedTask[]>([]);
+  const [mutedThreadIds, setMutedThreadIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
 
   const threadsEnabled =
     (settings.values?.sourceThreads as boolean | undefined) ?? true;
@@ -311,11 +314,26 @@ export function useNotificationEngine(): NotificationEngineState {
     ) {
       closeThreadOsNotification(payload.targetId);
     }
+    if (payload?.type === "mute-labels-changed") {
+      void rpc
+        .call("getMuteConfig", null)
+        .then((result) => {
+          setMutedThreadIds(new Set(result.mutedThreadIds));
+        })
+        .catch(() => undefined);
+    }
     void (async () => {
       try {
-        const result = await rpc.call("getUnreadCount", null);
         const enabled =
           (settings.values?.appBadge as boolean | undefined) ?? true;
+        // Mark-all-read must zero the app/tab badge even if a follow-up
+        // getUnreadCount races or fails.
+        if (payload?.type === "mark-all-read") {
+          setBadgeCount(0);
+          await syncAppBadge(0);
+          return;
+        }
+        const result = await rpc.call("getUnreadCount", null);
         setBadgeCount(result.unreadCount);
         if (enabled) {
           void syncAppBadge(result.unreadCount);
@@ -327,6 +345,30 @@ export function useNotificationEngine(): NotificationEngineState {
       }
     })();
   });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const pullMute = async () => {
+      try {
+        const result = await rpc.call("getMuteConfig", null);
+        if (cancelled) return;
+        setMutedThreadIds(new Set(result.mutedThreadIds));
+      } catch {
+        if (!cancelled) setMutedThreadIds(new Set());
+      }
+    };
+
+    void pullMute();
+    const timer = window.setInterval(() => {
+      void pullMute();
+    }, MUTE_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [rpc]);
 
   useEffect(() => {
     if (!tasksEnabled) {
@@ -367,23 +409,20 @@ export function useNotificationEngine(): NotificationEngineState {
       activeThreadId,
       threadsEnabled,
       osEnabled,
+      mutedThreadIds,
       openThread: (threadId) => {
         void threadActions.setRead(threadId, true).catch(() => undefined);
         navigate.toThread(threadId);
       },
-      record: async (thread, content) => {
+      record: async (thread) => {
         await rpc.call("record", {
           id: threadNotificationId(thread),
           source: "thread",
-          title: content.title,
-          body: content.body,
+          title: attentionNotificationTitle(thread),
+          body: attentionNotificationBody(thread),
           targetKind: "thread",
           targetId: thread.id,
         });
-      },
-      fetchResponsePreview: async (threadId) => {
-        const result = await rpc.call("getResponsePreview", { threadId });
-        return result.preview;
       },
       markRead: async (id) => {
         await rpc.call("markRead", { id }).catch(() => undefined);
@@ -426,6 +465,7 @@ export function useNotificationEngine(): NotificationEngineState {
     threadsEnabled,
     tasksEnabled,
     osEnabled,
+    mutedThreadIds,
     navigate,
     threadActions,
     rpc,
@@ -435,5 +475,6 @@ export function useNotificationEngine(): NotificationEngineState {
     attentionCount,
     assignedCount,
     badgeCount,
+    mutedThreadIds,
   };
 }
