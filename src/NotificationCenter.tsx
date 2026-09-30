@@ -11,8 +11,11 @@ import type { rpcContract, NotificationRow } from "../server";
 import { Button } from "@/components/ui/button";
 import { threadNeedsAttention } from "./attention";
 import { openTasksPluginTask } from "./assigned-tasks";
-import { closeThreadOsNotification, syncAppBadge } from "./desktop-alerts";
-import { useNotificationEngine } from "./useNotificationEngine";
+import { closeThreadOsNotification } from "./desktop-alerts";
+import {
+  applyUnreadBadgeCount,
+  useNotificationEngine,
+} from "./useNotificationEngine";
 import { cn } from "@/lib/utils";
 
 function relativeTime(epochMs: number, now: number): string {
@@ -38,7 +41,7 @@ function sourceLabel(source: NotificationRow["source"]): string {
 
 export function NotificationCenter() {
   // Keep the engine alive on compact viewports (sidebar accessory is hidden).
-  const { mutedThreadIds } = useNotificationEngine();
+  const { mutedThreadIds, badgeCount } = useNotificationEngine();
 
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
@@ -62,21 +65,50 @@ export function NotificationCenter() {
   }, []);
   const now = nowMinute * 60_000;
 
+  const badgeOn = (settings.values?.appBadge as boolean | undefined) ?? true;
+
   const refresh = useCallback(async () => {
     try {
-      const result = await rpc.call("list", {
+      let result = await rpc.call("list", {
         includeDismissed: false,
         limit: 50,
       });
+
+      // Drop center rows whose live thread no longer needs attention (missed
+      // dismiss edge → badge 1 with nothing useful in the list).
+      const staleIds: string[] = [];
+      for (const item of result.items) {
+        if (item.targetKind !== "thread") continue;
+        if (mutedThreadIds.has(item.targetId)) {
+          staleIds.push(item.id);
+          continue;
+        }
+        const thread = threads.find((row) => row.id === item.targetId);
+        if (thread && !threadNeedsAttention(thread)) {
+          staleIds.push(item.id);
+        }
+      }
+      if (staleIds.length > 0) {
+        for (const id of staleIds) {
+          await rpc.call("dismiss", { id }).catch(() => undefined);
+        }
+        result = await rpc.call("list", {
+          includeDismissed: false,
+          limit: 50,
+        });
+      }
+
       setItems(result.items);
       setUnreadCount(result.unreadCount);
+      // List is authoritative for the center — clear a stuck sidebar "1".
+      applyUnreadBadgeCount(result.unreadCount, { syncAppBadge: badgeOn });
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load");
     } finally {
       setLoading(false);
     }
-  }, [rpc]);
+  }, [rpc, badgeOn, threads, mutedThreadIds]);
 
   useEffect(() => {
     void refresh();
@@ -130,11 +162,7 @@ export function NotificationCenter() {
       [...threadIds].map((threadId) => clearThreadAttention(threadId)),
     );
     // Clear the Badging API / Dock badge immediately; do not wait on realtime.
-    const badgeOn =
-      (settings.values?.appBadge as boolean | undefined) ?? true;
-    if (badgeOn) {
-      await syncAppBadge(0);
-    }
+    applyUnreadBadgeCount(0, { syncAppBadge: badgeOn });
     await refresh();
   };
 
@@ -155,7 +183,8 @@ export function NotificationCenter() {
     if (mutedThreadIds.has(thread.id)) return count;
     return threadNeedsAttention(thread) ? count + 1 : count;
   }, 0);
-  const canMarkAllRead = unreadCount > 0 || sidebarAttentionCount > 0;
+  const canMarkAllRead =
+    unreadCount > 0 || sidebarAttentionCount > 0 || badgeCount > 0;
 
   return (
     <div className="flex h-full min-h-0 flex-col">

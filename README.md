@@ -112,7 +112,8 @@ bb plugin config notifications-pro set mutedLabels "automation"
 
 Prefer **Settings → Notifications Pro → Mute labels** for checkboxes. The
 `mutedLabels` string is a fallback when editing via CLI; the mute panel writes
-the same list through RPC (`setMutedLabels`).
+the same list through RPC (`setMutedLabels`). Muting a label dismisses existing
+center rows for those threads and clears them from the app/Dock badge count.
 
 ## Manual test (with Labels + Sidebar Pro)
 

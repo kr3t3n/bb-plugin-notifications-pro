@@ -51,8 +51,50 @@ let previousAssignedIds: Set<string> | null = null;
 let lastAssignedFingerprint: string | null = null;
 let engineMounts = 0;
 
+/** Shared nav/Dock badge so accessory + center never diverge after a missed realtime. */
+let sharedBadgeCount = 0;
+/** Monotonic epoch so a slow getUnreadCount cannot overwrite a newer dismiss/list. */
+let badgeEpoch = 0;
+const badgeListeners = new Set<(count: number) => void>();
+
 const ASSIGNED_POLL_MS = 5_000;
 const MUTE_POLL_MS = 10_000;
+const BADGE_POLL_MS = 2_000;
+
+/** Test helper — current shared badge value. */
+export function getSharedBadgeCount(): number {
+  return sharedBadgeCount;
+}
+
+/** Claim the next badge epoch before an async unread lookup. */
+export function beginBadgeRefresh(): number {
+  badgeEpoch += 1;
+  return badgeEpoch;
+}
+
+/**
+ * Push the center unread count into every mounted engine (sidebar accessory
+ * included). Call from the notification list refresh so an empty panel always
+ * clears a stuck "1". Pass `epoch` from beginBadgeRefresh() for async lookups.
+ */
+export function applyUnreadBadgeCount(
+  count: number,
+  options?: { syncAppBadge?: boolean; epoch?: number },
+): void {
+  const epoch = options?.epoch ?? beginBadgeRefresh();
+  if (epoch < badgeEpoch) return;
+  badgeEpoch = epoch;
+  const next = Math.max(0, Math.floor(count));
+  sharedBadgeCount = next;
+  for (const listener of badgeListeners) {
+    listener(next);
+  }
+  if (options?.syncAppBadge === false) {
+    void syncAppBadge(0);
+    return;
+  }
+  void syncAppBadge(next);
+}
 
 type ProcessThreadArgs = {
   threads: readonly PluginSidebarThread[];
@@ -249,7 +291,7 @@ export function useNotificationEngine(): NotificationEngineState {
   const rpc = useRpc<typeof rpcContract>();
   const [attentionCount, setAttentionCount] = useState(0);
   const [assignedCount, setAssignedCount] = useState(0);
-  const [badgeCount, setBadgeCount] = useState(0);
+  const [badgeCount, setBadgeCount] = useState(sharedBadgeCount);
   const [assignedTasks, setAssignedTasks] = useState<AssignedTask[]>([]);
   const [mutedThreadIds, setMutedThreadIds] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -263,6 +305,17 @@ export function useNotificationEngine(): NotificationEngineState {
     (settings.values?.osNotifications as boolean | undefined) ?? true;
   const badgeEnabled =
     (settings.values?.appBadge as boolean | undefined) ?? true;
+
+  useEffect(() => {
+    const listener = (count: number) => {
+      setBadgeCount(count);
+    };
+    badgeListeners.add(listener);
+    setBadgeCount(sharedBadgeCount);
+    return () => {
+      badgeListeners.delete(listener);
+    };
+  }, []);
 
   useEffect(() => {
     engineMounts += 1;
@@ -279,25 +332,37 @@ export function useNotificationEngine(): NotificationEngineState {
     let cancelled = false;
 
     const refreshBadge = async () => {
+      const epoch = beginBadgeRefresh();
       try {
         const result = await rpc.call("getUnreadCount", null);
         if (cancelled) return;
-        const next = result.unreadCount;
-        setBadgeCount(next);
-        if (badgeEnabled) {
-          void syncAppBadge(next);
-        } else {
-          void syncAppBadge(0);
-        }
+        applyUnreadBadgeCount(result.unreadCount, {
+          syncAppBadge: badgeEnabled,
+          epoch,
+        });
       } catch {
-        // Leave the last known badge if the lookup fails.
+        // Leave the last known badge if the lookup fails; the poll retries.
       }
     };
 
     void refreshBadge();
+    const timer = window.setInterval(() => {
+      void refreshBadge();
+    }, BADGE_POLL_MS);
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        void refreshBadge();
+      }
+    };
+    window.addEventListener("focus", onVisible);
+    document.addEventListener("visibilitychange", onVisible);
 
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener("focus", onVisible);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [rpc, badgeEnabled]);
 
@@ -306,6 +371,7 @@ export function useNotificationEngine(): NotificationEngineState {
       type?: string;
       targetKind?: string | null;
       targetId?: string | null;
+      unreadCount?: number;
     };
     if (
       payload?.type === "dismiss" &&
@@ -321,27 +387,38 @@ export function useNotificationEngine(): NotificationEngineState {
           setMutedThreadIds(new Set(result.mutedThreadIds));
         })
         .catch(() => undefined);
+      if (typeof payload.unreadCount === "number") {
+        const enabled =
+          (settings.values?.appBadge as boolean | undefined) ?? true;
+        applyUnreadBadgeCount(payload.unreadCount, {
+          syncAppBadge: enabled,
+        });
+      }
     }
     void (async () => {
       try {
         const enabled =
           (settings.values?.appBadge as boolean | undefined) ?? true;
-        // Mark-all-read must zero the app/tab badge even if a follow-up
-        // getUnreadCount races or fails.
-        if (payload?.type === "mark-all-read") {
-          setBadgeCount(0);
-          await syncAppBadge(0);
+        // Prefer the count stamped on the event so a slow follow-up RPC
+        // cannot resurrect a dismissed badge.
+        if (typeof payload?.unreadCount === "number") {
+          applyUnreadBadgeCount(payload.unreadCount, {
+            syncAppBadge: enabled,
+          });
           return;
         }
-        const result = await rpc.call("getUnreadCount", null);
-        setBadgeCount(result.unreadCount);
-        if (enabled) {
-          void syncAppBadge(result.unreadCount);
-        } else {
-          void syncAppBadge(0);
+        if (payload?.type === "mark-all-read") {
+          applyUnreadBadgeCount(0, { syncAppBadge: true });
+          return;
         }
+        const epoch = beginBadgeRefresh();
+        const result = await rpc.call("getUnreadCount", null);
+        applyUnreadBadgeCount(result.unreadCount, {
+          syncAppBadge: enabled,
+          epoch,
+        });
       } catch {
-        // Ignore transient badge refresh failures.
+        // Ignore transient badge refresh failures; the poll retries.
       }
     })();
   });

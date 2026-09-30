@@ -9,6 +9,28 @@ type BadgeNavigator = Navigator & {
   clearAppBadge?: () => Promise<void>;
 };
 
+type BbDesktopBridge = {
+  platform?: string;
+};
+
+/** Live page notifications, so dismiss can close the original instead of a blank stand-in. */
+const openOsNotifications = new Map<string, Notification>();
+
+function desktopPlatform(): string | null {
+  if (typeof window === "undefined") return null;
+  const desktop = (window as Window & { bbDesktop?: BbDesktopBridge }).bbDesktop;
+  return typeof desktop?.platform === "string" ? desktop.platform : null;
+}
+
+function rememberOsNotification(tag: string, notification: Notification): void {
+  openOsNotifications.set(tag, notification);
+  notification.onclose = () => {
+    if (openOsNotifications.get(tag) === notification) {
+      openOsNotifications.delete(tag);
+    }
+  };
+}
+
 /** Ask the browser for notification permission when it is still undecided. */
 export async function ensureNotificationPermission(): Promise<
   NotificationPermission | "unsupported"
@@ -53,6 +75,7 @@ export function showOsNotification(options: {
       body: options.body,
       tag: options.tag,
     });
+    rememberOsNotification(options.tag, notification);
     notification.onclick = () => {
       try {
         window.focus();
@@ -85,18 +108,33 @@ export function showThreadResponseNotification(
 }
 
 /**
- * Close a lingering OS toast for a thread by replacing the tag then closing.
- * Best-effort; some hosts ignore silent replace-close.
+ * Close a lingering OS toast for a thread.
+ * Prefer the original Notification handle. Hosts that ignore close() fall
+ * back to a silent same-tag replacement, except the Mac app: there the
+ * replacement is shown and close() is ignored, which leaves a blank toast.
+ * On macOS the original toast stays until the user dismisses it when close()
+ * itself does not stick.
  */
 export function closeThreadOsNotification(threadId: string): void {
   if (typeof window === "undefined" || typeof Notification === "undefined") {
     return;
   }
   if (Notification.permission !== "granted") return;
+  const tag = threadOsNotificationTag(threadId);
+  const existing = openOsNotifications.get(tag);
+  if (existing) {
+    openOsNotifications.delete(tag);
+    try {
+      existing.close();
+    } catch {
+      // Some hosts ignore Notification.close().
+    }
+  }
+  if (desktopPlatform() === "macos") return;
   try {
     const notification = new Notification(" ", {
       body: " ",
-      tag: threadOsNotificationTag(threadId),
+      tag,
       silent: true,
     });
     notification.close();
@@ -119,25 +157,53 @@ export function showAssignedTaskNotification(
 
 /**
  * Badge the host app icon with a count.
- * On bb's Electron macOS build this maps to the Dock badge via Chromium's
- * Badging API (`navigator.setAppBadge`). Zero clears it.
+ * On installed PWAs (and bb's Electron macOS Dock) this uses Chromium/WebKit
+ * Badging (`navigator.setAppBadge`). Zero clears it. Also mirrors the count
+ * into the root service worker — iOS home-screen badges often stick if only
+ * the page calls clear while the SW last set the count.
  */
 export async function syncAppBadge(count: number): Promise<void> {
   if (typeof navigator === "undefined") return;
+  const next = Math.max(0, Math.floor(count));
   const badgeNav = navigator as BadgeNavigator;
   try {
-    if (count <= 0) {
+    if (next <= 0) {
       if (typeof badgeNav.clearAppBadge === "function") {
         await badgeNav.clearAppBadge();
-      } else if (typeof badgeNav.setAppBadge === "function") {
+      }
+      if (typeof badgeNav.setAppBadge === "function") {
         await badgeNav.setAppBadge(0);
       }
-      return;
-    }
-    if (typeof badgeNav.setAppBadge === "function") {
-      await badgeNav.setAppBadge(count);
+      await closeServiceWorkerNotifications();
+    } else if (typeof badgeNav.setAppBadge === "function") {
+      await badgeNav.setAppBadge(next);
     }
   } catch {
     // Badging is optional; Chromium/Electron may reject it.
+  }
+  await postBadgeToServiceWorker(next);
+}
+
+async function postBadgeToServiceWorker(count: number): Promise<void> {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    registration.active?.postMessage({ type: "np-sync-badge", count });
+  } catch {
+    // SW may be missing on desktop-only installs.
+  }
+}
+
+/** Drop SW-shown tray notifications so Android launcher badges can clear. */
+async function closeServiceWorkerNotifications(): Promise<void> {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    const notes = await registration.getNotifications();
+    for (const note of notes) {
+      note.close();
+    }
+  } catch {
+    // Optional.
   }
 }

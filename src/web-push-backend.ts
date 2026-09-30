@@ -22,6 +22,8 @@ export type PushPayload = {
   targetKind: "thread" | "task";
   targetId: string;
   notificationId: string;
+  /** Center unread count after this record — drives the PWA icon badge. */
+  unreadCount?: number;
 };
 
 export type VapidKeyPair = {
@@ -163,6 +165,7 @@ export function buildPushPayloadJson(payload: PushPayload): string {
     targetKind: payload.targetKind,
     targetId: payload.targetId,
     notificationId: payload.notificationId,
+    unreadCount: payload.unreadCount ?? null,
   });
 }
 

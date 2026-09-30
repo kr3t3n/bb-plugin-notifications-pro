@@ -190,6 +190,8 @@ export const rpcContract = defineRpcContract({
     output: z
       .object({
         mutedLabels: z.array(z.string()),
+        unreadCount: z.number().int(),
+        dismissed: z.number().int(),
       })
       .strict(),
   },
@@ -250,21 +252,73 @@ function rowFromStmt(row: Record<string, unknown>): NotificationRow {
   });
 }
 
+function currentUnreadCount(
+  db: Db,
+  mutedThreadIds?: ReadonlySet<string> | null,
+): number {
+  if (!mutedThreadIds || mutedThreadIds.size === 0) {
+    return (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM notifications
+           WHERE read_at IS NULL AND dismissed_at IS NULL`,
+        )
+        .get() as { c: number }
+    ).c;
+  }
+  // Unread volume is small; filter muted thread targets in process.
+  const rows = db
+    .prepare(
+      `SELECT target_kind AS targetKind, target_id AS targetId
+       FROM notifications
+       WHERE read_at IS NULL AND dismissed_at IS NULL`,
+    )
+    .all() as Array<{ targetKind: string; targetId: string }>;
+  let count = 0;
+  for (const row of rows) {
+    if (row.targetKind === "thread" && mutedThreadIds.has(row.targetId)) {
+      continue;
+    }
+    count += 1;
+  }
+  return count;
+}
+
+/** Dismiss undismissed rows for muted threads so the app badge can clear. */
+function dismissNotificationsForThreads(
+  db: Db,
+  threadIds: readonly string[],
+): number {
+  if (threadIds.length === 0) return 0;
+  const now = Date.now();
+  let dismissed = 0;
+  const chunkSize = 400;
+  for (let i = 0; i < threadIds.length; i += chunkSize) {
+    const chunk = threadIds.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => "?").join(", ");
+    const result = db
+      .prepare(
+        `UPDATE notifications
+         SET dismissed_at = ?, read_at = COALESCE(read_at, ?)
+         WHERE dismissed_at IS NULL
+           AND target_kind = 'thread'
+           AND target_id IN (${placeholders})`,
+      )
+      .run(now, now, ...chunk);
+    dismissed += result.changes;
+  }
+  return dismissed;
+}
+
 function listNotifications(
   db: Db,
   includeDismissed: boolean,
   limit: number,
+  mutedThreadIds?: ReadonlySet<string> | null,
 ): { items: NotificationRow[]; unreadCount: number } {
-  const unreadCount = (
-    db
-      .prepare(
-        `SELECT COUNT(*) AS c FROM notifications
-         WHERE read_at IS NULL AND dismissed_at IS NULL`,
-      )
-      .get() as { c: number }
-  ).c;
+  const unreadCount = currentUnreadCount(db, mutedThreadIds);
 
-  const items = includeDismissed
+  let items = includeDismissed
     ? (db
         .prepare(
           `SELECT * FROM notifications
@@ -280,6 +334,13 @@ function listNotifications(
            LIMIT ?`,
         )
         .all(limit) as Record<string, unknown>[]);
+
+  if (mutedThreadIds && mutedThreadIds.size > 0 && !includeDismissed) {
+    items = items.filter((row) => {
+      if (row.target_kind !== "thread") return true;
+      return !mutedThreadIds.has(String(row.target_id));
+    });
+  }
 
   return { items: items.map(rowFromStmt), unreadCount };
 }
@@ -375,11 +436,39 @@ export default async function plugin(bb: BbPluginApi) {
   async function writeMutedLabels(labels: readonly string[]): Promise<string[]> {
     const next = serializeMutedLabels(labels);
     await bb.storage.kv.set(MUTED_LABELS_KV_KEY, next);
-    bb.realtime.publish("notifications", {
-      type: "mute-labels-changed",
-      mutedLabels: next,
-    });
+    // Keep the settings string in sync with the panel/RPC list (CLI fallback).
+    try {
+      await settings.set({ mutedLabels: next.join(", ") });
+    } catch {
+      // Older hosts may not expose settings.set; KV remains authoritative.
+    }
     return next;
+  }
+
+  async function resolveMutedThreadIdSet(): Promise<Set<string>> {
+    const mutedLabels = await readMutedLabels();
+    if (mutedLabels.length === 0) return new Set();
+    const snap = await fetchLabelsProSnapshot(mutedLabels);
+    return new Set(snap.mutedThreadIds);
+  }
+
+  /**
+   * Drop center rows for muted threads and return the badge count that should
+   * remain. Mute used to skip toasts only — pre-mute unread rows kept the
+   * Dock / app icon badge alive.
+   */
+  async function reconcileMutedNotifications(): Promise<{
+    mutedLabels: string[];
+    mutedThreadIds: string[];
+    dismissed: number;
+    unreadCount: number;
+  }> {
+    const mutedLabels = await readMutedLabels();
+    const snap = await fetchLabelsProSnapshot(mutedLabels);
+    const mutedThreadIds = snap.mutedThreadIds;
+    const dismissed = dismissNotificationsForThreads(db, mutedThreadIds);
+    const unreadCount = currentUnreadCount(db, new Set(mutedThreadIds));
+    return { mutedLabels, mutedThreadIds, dismissed, unreadCount };
   }
 
   async function fetchLabelsProSnapshot(
@@ -539,6 +628,7 @@ export default async function plugin(bb: BbPluginApi) {
         targetKind: item.targetKind,
         targetId: item.targetId,
         notificationId: item.id,
+        unreadCount: currentUnreadCount(db),
       },
       send: async (subscription, payload) => {
         // Embed href for the service worker click handler.
@@ -567,9 +657,36 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.rpc.register(rpcContract, {
-    list: (input) =>
-      listNotifications(db, input.includeDismissed, input.limit),
-    record: (input) => {
+    list: async (input) => {
+      const muted = await resolveMutedThreadIdSet();
+      return listNotifications(
+        db,
+        input.includeDismissed,
+        input.limit,
+        muted,
+      );
+    },
+    record: async (input) => {
+      if (input.targetKind === "thread") {
+        const muted = await resolveMutedThreadIdSet();
+        if (muted.has(input.targetId)) {
+          // Do not grow the center / badge for muted-label threads.
+          return {
+            item: {
+              id: input.id,
+              source: input.source,
+              title: input.title,
+              body: input.body,
+              targetKind: input.targetKind,
+              targetId: input.targetId,
+              createdAt: Date.now(),
+              readAt: Date.now(),
+              dismissedAt: Date.now(),
+            },
+            created: false,
+          };
+        }
+      }
       const existing = db
         .prepare(`SELECT id FROM notifications WHERE id = ?`)
         .get(input.id) as { id: string } | undefined;
@@ -604,7 +721,12 @@ export default async function plugin(bb: BbPluginApi) {
         readAt: null,
         dismissedAt: null,
       };
-      bb.realtime.publish("notifications", { type: "recorded", item });
+      const muted = await resolveMutedThreadIdSet();
+      bb.realtime.publish("notifications", {
+        type: "recorded",
+        item,
+        unreadCount: currentUnreadCount(db, muted),
+      });
       // Push is additive: never let send failures break the notification log.
       void sendPushesForRecord(item).catch((error) => {
         const message =
@@ -613,7 +735,7 @@ export default async function plugin(bb: BbPluginApi) {
       });
       return { item, created: true };
     },
-    markRead: ({ id }) => {
+    markRead: async ({ id }) => {
       const result = db
         .prepare(
           `UPDATE notifications
@@ -622,7 +744,12 @@ export default async function plugin(bb: BbPluginApi) {
         )
         .run(Date.now(), id);
       if (result.changes > 0) {
-        bb.realtime.publish("notifications", { type: "mark-read", id });
+        const muted = await resolveMutedThreadIdSet();
+        bb.realtime.publish("notifications", {
+          type: "mark-read",
+          id,
+          unreadCount: currentUnreadCount(db, muted),
+        });
       }
       return { ok: result.changes > 0 };
     },
@@ -639,10 +766,11 @@ export default async function plugin(bb: BbPluginApi) {
       bb.realtime.publish("notifications", {
         type: "mark-all-read",
         updated: result.changes,
+        unreadCount: 0,
       });
       return { updated: result.changes };
     },
-    dismiss: ({ id }) => {
+    dismiss: async ({ id }) => {
       const existing = db
         .prepare(`SELECT * FROM notifications WHERE id = ?`)
         .get(id) as Record<string, unknown> | undefined;
@@ -654,16 +782,18 @@ export default async function plugin(bb: BbPluginApi) {
         )
         .run(Date.now(), Date.now(), id);
       if (result.changes > 0) {
+        const muted = await resolveMutedThreadIdSet();
         bb.realtime.publish("notifications", {
           type: "dismiss",
           id,
           targetKind: existing?.target_kind ?? null,
           targetId: existing?.target_id ?? null,
+          unreadCount: currentUnreadCount(db, muted),
         });
       }
       return { ok: result.changes > 0 };
     },
-    dismissForTarget: ({ targetKind, targetId }) => {
+    dismissForTarget: async ({ targetKind, targetId }) => {
       const now = Date.now();
       const result = db
         .prepare(
@@ -673,25 +803,20 @@ export default async function plugin(bb: BbPluginApi) {
         )
         .run(now, now, targetKind, targetId);
       if (result.changes > 0) {
+        const muted = await resolveMutedThreadIdSet();
         bb.realtime.publish("notifications", {
           type: "dismiss-for-target",
           targetKind,
           targetId,
           dismissed: result.changes,
+          unreadCount: currentUnreadCount(db, muted),
         });
       }
       return { dismissed: result.changes };
     },
-    getUnreadCount: () => {
-      const unreadCount = (
-        db
-          .prepare(
-            `SELECT COUNT(*) AS c FROM notifications
-             WHERE read_at IS NULL AND dismissed_at IS NULL`,
-          )
-          .get() as { c: number }
-      ).c;
-      return { unreadCount };
+    getUnreadCount: async () => {
+      const muted = await resolveMutedThreadIdSet();
+      return { unreadCount: currentUnreadCount(db, muted) };
     },
     clearDismissed: () => {
       const result = db
@@ -753,16 +878,62 @@ export default async function plugin(bb: BbPluginApi) {
     },
     async setMutedLabels({ labels }) {
       const mutedLabels = await writeMutedLabels(labels);
-      return { mutedLabels };
+      const reconciled = await reconcileMutedNotifications();
+      bb.realtime.publish("notifications", {
+        type: "mute-labels-changed",
+        mutedLabels,
+        unreadCount: reconciled.unreadCount,
+        dismissed: reconciled.dismissed,
+      });
+      return {
+        mutedLabels,
+        unreadCount: reconciled.unreadCount,
+        dismissed: reconciled.dismissed,
+      };
     },
   });
+
+  // Clear stale badge rows for already-muted labels (CLI/settings mute used
+  // to skip toasts only and leave center unread counts behind).
+  void reconcileMutedNotifications()
+    .then((result) => {
+      if (result.dismissed <= 0) return;
+      bb.realtime.publish("notifications", {
+        type: "mute-labels-changed",
+        mutedLabels: result.mutedLabels,
+        unreadCount: result.unreadCount,
+        dismissed: result.dismissed,
+      });
+      bb.log.info(
+        `muted-label reconcile dismissed=${result.dismissed} unread=${result.unreadCount}`,
+      );
+    })
+    .catch((error) => {
+      const message =
+        error instanceof Error ? error.message : "mute reconcile failed";
+      bb.log.warn(`muted-label reconcile failed: ${message}`);
+    });
 
   void settings.get();
 
   // Root-scoped service worker: push display + click → thread/task.
   // Path is /api/v1/plugins/<id>/http/sw.js — Service-Worker-Allowed expands scope.
+  // v3: sync PWA icon badge from push payload and from page postMessage.
   const SW_SCRIPT = [
-    "/* notifications-pro web-push v2 */",
+    "/* notifications-pro web-push v3 */",
+    "async function npSyncBadge(count) {",
+    "  const next = Math.max(0, Math.floor(Number(count) || 0));",
+    "  try {",
+    "    if (next <= 0) {",
+    "      if (self.navigator.clearAppBadge) await self.navigator.clearAppBadge();",
+    "      if (self.navigator.setAppBadge) await self.navigator.setAppBadge(0);",
+    "      const notes = await self.registration.getNotifications();",
+    "      for (const note of notes) note.close();",
+    "    } else if (self.navigator.setAppBadge) {",
+    "      await self.navigator.setAppBadge(next);",
+    "    }",
+    "  } catch (_) {}",
+    "}",
     "self.addEventListener('install', (event) => {",
     "  event.waitUntil(self.skipWaiting());",
     "});",
@@ -770,14 +941,22 @@ export default async function plugin(bb: BbPluginApi) {
     "  event.waitUntil(self.clients.claim());",
     "});",
     "self.addEventListener('message', (event) => {",
-    "  if (event.data && event.data.type === 'np-spike-skip-waiting') {",
+    "  const data = event.data || {};",
+    "  if (data.type === 'np-spike-skip-waiting') {",
     "    self.skipWaiting();",
+    "    return;",
+    "  }",
+    "  if (data.type === 'np-sync-badge') {",
+    "    event.waitUntil(npSyncBadge(data.count));",
     "  }",
     "});",
     "self.addEventListener('push', (event) => {",
     "  event.waitUntil((async () => {",
     "    let data = {};",
     "    try { data = event.data ? event.data.json() : {}; } catch (_) {}",
+    "    if (typeof data.unreadCount === 'number') {",
+    "      await npSyncBadge(data.unreadCount);",
+    "    }",
     "    const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });",
     "    const visible = clients.some((c) => c.visibilityState === 'visible');",
     "    // Double-alert rule: if any bb window is visible, skip push UI;",
@@ -796,6 +975,7 @@ export default async function plugin(bb: BbPluginApi) {
     "        targetId: data.targetId || null,",
     "        notificationId: data.notificationId || null,",
     "        href: data.href || '/',",
+    "        unreadCount: typeof data.unreadCount === 'number' ? data.unreadCount : null,",
     "      },",
     "    });",
     "  })());",

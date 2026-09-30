@@ -52,17 +52,48 @@ describe("syncAppBadge", () => {
   it("sets the badge when the Badging API exists", async () => {
     const setAppBadge = vi.fn(async () => undefined);
     const clearAppBadge = vi.fn(async () => undefined);
-    vi.stubGlobal("navigator", { setAppBadge, clearAppBadge });
+    const postMessage = vi.fn();
+    vi.stubGlobal("navigator", {
+      setAppBadge,
+      clearAppBadge,
+      serviceWorker: {
+        ready: Promise.resolve({
+          active: { postMessage },
+          getNotifications: async () => [],
+        }),
+      },
+    });
     await syncAppBadge(3);
     expect(setAppBadge).toHaveBeenCalledWith(3);
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "np-sync-badge",
+      count: 3,
+    });
   });
 
   it("clears the badge at zero", async () => {
     const setAppBadge = vi.fn(async () => undefined);
     const clearAppBadge = vi.fn(async () => undefined);
-    vi.stubGlobal("navigator", { setAppBadge, clearAppBadge });
+    const close = vi.fn();
+    const postMessage = vi.fn();
+    vi.stubGlobal("navigator", {
+      setAppBadge,
+      clearAppBadge,
+      serviceWorker: {
+        ready: Promise.resolve({
+          active: { postMessage },
+          getNotifications: async () => [{ close }],
+        }),
+      },
+    });
     await syncAppBadge(0);
     expect(clearAppBadge).toHaveBeenCalled();
+    expect(setAppBadge).toHaveBeenCalledWith(0);
+    expect(close).toHaveBeenCalled();
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "np-sync-badge",
+      count: 0,
+    });
   });
 });
 
@@ -101,18 +132,33 @@ describe("showThreadResponseNotification", () => {
   });
 });
 
+function grantedNotificationMock() {
+  const instances: Array<{
+    onclick: null | (() => void);
+    onclose: null | (() => void);
+    close: ReturnType<typeof vi.fn>;
+  }> = [];
+  const NotificationMock = vi.fn(function NotificationMock(
+    this: {
+      onclick: null | (() => void);
+      onclose: null | (() => void);
+      close: ReturnType<typeof vi.fn>;
+    },
+  ) {
+    this.onclick = null;
+    this.onclose = null;
+    this.close = vi.fn();
+    instances.push(this);
+  });
+  Object.assign(NotificationMock, {
+    permission: "granted" as NotificationPermission,
+  });
+  return { NotificationMock, instances };
+}
+
 describe("closeThreadOsNotification", () => {
   it("replaces the tag and closes when permission is granted", () => {
-    const close = vi.fn();
-    const NotificationMock = vi.fn(function NotificationMock(
-      this: { onclick: null | (() => void); close: () => void },
-    ) {
-      this.onclick = null;
-      this.close = close;
-    });
-    Object.assign(NotificationMock, {
-      permission: "granted" as NotificationPermission,
-    });
+    const { NotificationMock, instances } = grantedNotificationMock();
     vi.stubGlobal("Notification", NotificationMock);
     vi.stubGlobal("window", { focus: vi.fn() });
 
@@ -122,7 +168,28 @@ describe("closeThreadOsNotification", () => {
       tag: "bb-notifications-pro:thread:thr_1",
       silent: true,
     });
-    expect(close).toHaveBeenCalled();
+    expect(instances[0]?.close).toHaveBeenCalled();
+  });
+
+  it("closes the original toast and does not post a blank one on macOS", () => {
+    const { NotificationMock, instances } = grantedNotificationMock();
+    vi.stubGlobal("Notification", NotificationMock);
+    vi.stubGlobal("window", {
+      focus: vi.fn(),
+      bbDesktop: { platform: "macos" },
+    });
+
+    expect(showThreadResponseNotification(thread(), () => undefined)).toBe(
+      true,
+    );
+    closeThreadOsNotification("thr_1");
+
+    expect(NotificationMock).toHaveBeenCalledTimes(1);
+    expect(NotificationMock).toHaveBeenCalledWith("Hello", {
+      body: "Agent responded",
+      tag: "bb-notifications-pro:thread:thr_1",
+    });
+    expect(instances[0]?.close).toHaveBeenCalled();
   });
 });
 
