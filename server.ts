@@ -198,8 +198,15 @@ export const rpcContract = defineRpcContract({
 });
 
 const VAPID_KV_KEY = "vapid.keypair";
-// Apple Push rejects invalid/local subjects with BadJwtToken.
-const VAPID_SUBJECT = "https://bb-agents.taile81e05.ts.net";
+// Apple Push rejects invalid/local subjects with BadJwtToken, so use the
+// public app URL (BB_APP_URL, such as a Tailscale Serve address) and fall
+// back to the bb site.
+const VAPID_SUBJECT_FALLBACK = "https://getbb.app";
+
+function vapidSubject(appUrl: string | null | undefined): string {
+  const url = appUrl?.trim().replace(/\/$/, "");
+  return url && url.startsWith("https://") ? url : VAPID_SUBJECT_FALLBACK;
+}
 
 type Db = ReturnType<BbPluginApi["storage"]["database"]>;
 
@@ -636,7 +643,10 @@ export default async function plugin(bb: BbPluginApi) {
         const withHref = JSON.stringify({ ...parsed, href });
         await webpush.sendNotification(subscription, withHref, {
           vapidDetails: {
-            subject: VAPID_SUBJECT,
+            subject: vapidSubject(
+              (bb.server as { experimental_appUrl?: string | null })
+                .experimental_appUrl,
+            ),
             publicKey: keys.publicKey,
             privateKey: keys.privateKey,
           },
